@@ -1,70 +1,73 @@
 # TICK
 
-A Spring Boot service for ingesting, validating, storing, and querying simulated market events.
+Simulated market event ingestion service built with Spring Boot and PostgreSQL.
 
 ## Overview
 
-TICK models a small backend service for market-style event data. It focuses on reliable ingestion rather than trading or market-data distribution.
+TICK is an event ingestion service designed around the core backend requirements of financial data systems: deterministic validation, idempotency, transactional writes, and bounded queries.
 
-The service is designed around:
+Market events are simulated and not connected to live exchange feeds.
 
-- request validation
-- idempotent event ingestion
-- transactional database operations
-- event filtering and pagination
-- audit records
-- automated tests
-
-Market events are simulated and are not sourced from a live exchange.
-
-## Stack
+## Tech Stack
 
 - Java 17
-- Spring Boot 3.3.4
+- Spring Boot 3.3.4 (Spring Web, Spring Data JPA, Validation)
 - PostgreSQL 16
-- Flyway (Database Migrations)
-- JUnit 5 / Mockito
-- Docker & Docker Compose
+- Flyway (schema migrations)
+- JUnit 5 and Mockito
+- Docker and Docker Compose
+
+## Architecture and Key Decisions
+
+### 1. Dual-Layer Idempotency
+`eventId` is the producer-assigned idempotency key. Duplicate submissions must never produce multiple records.
+- **Application check**: `EventIngestionService` checks for record existence before saving.
+- **Database constraint**: PostgreSQL enforces `UNIQUE (event_id)` on the `market_events` table. Concurrent requests racing past the application check are stopped by PostgreSQL. The service catches the constraint violation (`DataIntegrityViolationException`) and returns `409 Conflict`.
+
+### 2. Transaction Boundaries
+- Transaction management lives in the service layer (`@Transactional`).
+- Audit logs use `Propagation.REQUIRES_NEW` so that audit records are committed even if the primary ingestion operation fails or rolls back.
+
+### 3. Querying and Pagination
+- Repeated queries must yield deterministic results. Results are ordered by `eventTime DESC, id DESC`.
+- Page size is clamped between 1 and 100 (default 20) to prevent unbounded memory allocation.
+- Dynamic filtering uses Spring Data JPA specifications across instrument symbol, event type, and time bounds.
 
 ## Project Structure
-
-The application follows a conventional Spring Boot structure:
 
 ```text
 src/
 ├── main/
-│   ├── java/
-│   │   └── com/tick/market/
-│   │       ├── config/           # Spring & Jackson configuration
-│   │       ├── controller/       # REST API endpoints
-│   │       ├── dto/              # Request, response, error DTOs
-│   │       ├── entity/           # JPA entities & domain enums
-│   │       ├── exception/        # Custom exceptions & global advice
-│   │       ├── repository/       # Spring Data JPA repositories
-│   │       ├── service/          # Business logic & transaction boundaries
-│   │       ├── specification/   # Dynamic query specifications
-│   │       └── validator/        # Custom validation logic
+│   ├── java/com/tick/market/
+│   │   ├── config/            # Jackson and Web MVC configuration
+│   │   ├── controller/        # REST endpoints
+│   │   ├── dto/               # Request, response, error payloads
+│   │   ├── entity/            # JPA entities and enums
+│   │   ├── exception/         # Exceptions and global ControllerAdvice
+│   │   ├── repository/        # Spring Data repositories
+│   │   ├── service/           # Ingestion, query, and audit business logic
+│   │   ├── specification/     # Dynamic JPA query specifications
+│   │   ├── validator/         # Domain payload validation rules
+│   │   └── TickApplication.java
 │   └── resources/
-│       ├── application.yml       # Application properties
-│       ├── application-dev.yml   # Dev PostgreSQL configuration
-│       └── db/migration/         # Flyway SQL migration scripts
+│       ├── application.yml
+│       ├── application-dev.yml
+│       ├── application-test.yml
+│       └── db/migration/      # Flyway SQL migrations
 └── test/
-    └── java/
-        └── com/tick/market/      # Unit, integration, and web slice tests
+    └── java/com/tick/market/  # Unit, MockMvc, and DataJpaTest suites
 ```
 
-The package structure separates API/controllers, services, persistence, domain models, and configuration.
+## API Specification
 
-## API
-
-### Create an event
+### Ingest Event
 
 ```http
 POST /api/v1/events
 Content-Type: application/json
 ```
 
-Example request:
+Request body:
 
 ```json
 {
@@ -88,30 +91,26 @@ Response (`201 Created`):
 }
 ```
 
-The `eventId` is used as the idempotency key. Submitting the same event more than once must not create duplicate event records and returns `409 Conflict`.
+Error responses:
+- `400 Bad Request`: Payload validation failure (missing required fields, invalid symbol, negative price/quantity, or invalid timestamp).
+- `409 Conflict`: Event with the same `eventId` has already been ingested.
 
-### Query events
+### Query Events
 
 ```http
 GET /api/v1/events
 ```
 
-Supported query filters:
+Query parameters:
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `symbol` | `string` | Filter by instrument symbol (e.g. `AAPL`) |
-| `eventType` | `string` | Filter by event type (`TRADE`, `QUOTE`, etc.) |
-| `from` | `ISO-8601` | Minimum timestamp inclusive (e.g. `2026-10-10T00:00:00Z`) |
-| `to` | `ISO-8601` | Maximum timestamp inclusive (e.g. `2026-10-10T23:59:59Z`) |
-| `page` | `integer` | Page index (0-indexed, default `0`) |
-| `size` | `integer` | Page size (1–100, default `20`) |
-
-Example:
-
-```http
-GET /api/v1/events?symbol=AAPL&eventType=TRADE&page=0&size=20
-```
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | String | No | Case-insensitive instrument symbol (e.g. `AAPL`) |
+| `eventType` | String | No | Event classification (`TRADE`, `QUOTE`, `PRICE_UPDATE`, `ORDER_CANCEL`, `HALT`) |
+| `from` | ISO-8601 | No | Inclusive start timestamp UTC (e.g. `2026-10-10T00:00:00Z`) |
+| `to` | ISO-8601 | No | Inclusive end timestamp UTC (e.g. `2026-10-10T23:59:59Z`) |
+| `page` | Integer | No | Zero-based page index (default: 0) |
+| `size` | Integer | No | Page size clamped between 1 and 100 (default: 20) |
 
 Response (`200 OK`):
 
@@ -138,118 +137,73 @@ Response (`200 OK`):
 }
 ```
 
-### Get event by ID
+### Get Event by ID
 
 ```http
 GET /api/v1/events/{eventId}
 ```
 
-## Idempotency
+Returns `200 OK` with the event object, or `404 Not Found` if missing.
 
-TICK treats `eventId` as a unique identifier for an incoming event.
+## Database Schema
 
-Idempotency is enforced at two levels:
+Migrations are managed via Flyway (`V1__init_schema.sql`).
 
-1. **Application level**: The ingestion service queries the repository for an existing event identifier before saving.
-2. **Database level**: PostgreSQL enforces a `UNIQUE` constraint on the `event_id` column.
+### `market_events`
+- `id`: BIGSERIAL PRIMARY KEY
+- `event_id`: VARCHAR(128) NOT NULL UNIQUE
+- `symbol`: VARCHAR(32) NOT NULL
+- `event_type`: VARCHAR(32) NOT NULL
+- `price`: NUMERIC(19, 4)
+- `quantity`: NUMERIC(19, 4)
+- `event_time`: TIMESTAMPTZ NOT NULL
+- `received_at`: TIMESTAMPTZ NOT NULL
+- `created_at`: TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 
-The database constraint is required because an application-level existence check alone is not sufficient to prevent duplicates under concurrent requests. If concurrent requests race past the application check, the database constraint rejects the second insert, which the service captures and translates into a `409 Conflict` response.
+Indexes:
+- `idx_market_events_symbol_time (symbol, event_time DESC)`
+- `idx_market_events_type_time (event_type, event_time DESC)`
+- `idx_market_events_event_time (event_time DESC)`
 
-## Transactions
+### `audit_records`
+- `id`: BIGSERIAL PRIMARY KEY
+- `event_id`: VARCHAR(128) NOT NULL
+- `operation`: VARCHAR(64) NOT NULL
+- `status`: VARCHAR(32) NOT NULL
+- `message`: TEXT
+- `recorded_at`: TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 
-Event persistence and its associated audit operation are handled within an appropriate transaction boundary using Spring's `@Transactional`.
+Indexes:
+- `idx_audit_records_event_id (event_id)`
+- `idx_audit_records_recorded_at (recorded_at DESC)`
 
-The goal is to prevent partially committed state when a write operation fails.
-
-## Data
-
-The initial persistence model contains two main concepts:
-
-### Market Event
-
-Stores the simulated market event and its associated timestamps.
-
-- `id`: Auto-generated primary key
-- `event_id`: Unique producer-supplied event identifier
-- `symbol`: Instrument identifier (e.g., `AAPL`)
-- `event_type`: Type of market event (`TRADE`, `QUOTE`, `PRICE_UPDATE`, `ORDER_CANCEL`, `HALT`)
-- `price`: Event price
-- `quantity`: Event quantity
-- `event_time`: Event producer timestamp (UTC)
-- `received_at`: Service receipt timestamp (UTC)
-- `created_at`: Row creation timestamp
-
-Composite and selective indexes (`symbol, event_time`, `event_type, event_time`, `event_time`) optimize query performance.
-
-### Audit Record
-
-Stores information about the ingestion operation, including its result, error message, and timestamp:
-
-- `id`: Primary key
-- `event_id`: Targeted event identifier
-- `operation`: Action performed (`INGEST_EVENT`)
-- `status`: Outcome status (`ACCEPTED`, `DUPLICATE`, `REJECTED`, `FAILED`)
-- `message`: Context or failure details
-- `recorded_at`: Timestamp of the audit event
-
-## Testing
-
-The test suite covers the behavior that matters to the service, including:
-
-- request validation (positive numbers, ISO timestamps, required fields)
-- duplicate event handling (idempotency checks)
-- concurrent duplicate submissions (database unique constraint translation)
-- transactional behavior and atomicity
-- filtering by symbol, event type, and date range
-- pagination bounds and stable result ordering
-
-## Running Locally
+## Local Development
 
 ### Requirements
-
 - JDK 17
+- Docker and Docker Compose
 - Maven 3.8+
-- Docker & Docker Compose
 
-### 1. Start Database
-
-Start PostgreSQL via Docker Compose:
+### 1. Start PostgreSQL
 
 ```bash
 docker compose up -d
 ```
 
-### 2. Run the Application
+Starts PostgreSQL on port `5432` with database `tick_db` and user `tick_user`.
 
-Run the Spring Boot application using Maven:
+### 2. Run the Service
 
 ```bash
 mvn spring-boot:run
 ```
 
-The service starts on `http://localhost:8080`.
+The application runs on `http://localhost:8080`.
 
 ### 3. Run Tests
-
-Execute the automated test suite:
 
 ```bash
 mvn test
 ```
 
-## Development Notes
-
-The project intentionally keeps the API and infrastructure small.
-
-The main implementation concerns are:
-
-- keeping validation separate from persistence logic
-- defining clear transaction boundaries in the service layer
-- enforcing uniqueness in PostgreSQL
-- avoiding unbounded query results through strict pagination caps
-- keeping API error responses consistent
-- testing failure and concurrency cases
-
-## Status
-
-TICK is under active development. Core domain entities, Flyway migrations, ingestion and query services, validation rules, REST controllers, and test harnesses are implemented.
+Unit and slice tests run against an in-memory database using the `test` profile.
