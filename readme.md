@@ -206,4 +206,4 @@ The application runs on `http://localhost:8080`.
 mvn test
 ```
 
-Unit and slice tests run against an in-memory database using the `test` profile.
+Unit and slice tests run against an in-memory database using the `test` profile
